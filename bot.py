@@ -10,6 +10,9 @@ import json  # работа с JSON(JavaScript Object Notation) файлами
 import random  # рандомайзер
 import queue  # очередь
 import logging  # логирование
+import uuid
+import json as _json
+import difflib
 
 from bs4 import BeautifulSoup  # парсит HTML страницу и забирает от туда данные
 from dotenv import load_dotenv  # загрузка переменных .env в память
@@ -19,6 +22,7 @@ from collections import deque  # дэк для записи заголовков
 from xml.etree import ElementTree as ET
 from urllib.parse import urlparse
 from typing import List, Dict, Optional
+from typing import Tuple, Any
 
 load_dotenv()  # загружает переменные из .env
 
@@ -37,6 +41,12 @@ INTERVAL_CHECK = int(os.getenv("INTERVAL_CHECK"))  # интервал прове
 URL_CG = os.getenv("URL_CG")  # CoinGecko конечная точка
 FEARGREED_API = os.getenv("FEARGREED_API")  # апи страха и жадности
 PINNED_INTERVAL_CHECK = int(os.getenv("PINNED_INTERVAL_CHECK"))  # интервал обновления закрепа
+
+# Константы и lock для сортировки по смыслу
+SEMANTIC_MEMORY_FILE = os.getenv("SEMANTIC_MEMORY_FILE")
+SEMANTIC_LOCK = os.getenv("SEMANTIC_LOCK")
+SEMANTIC_COMPARE_LIMIT = int(os.getenv("SEMANTIC_COMPARE_LIMIT"))
+SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_THRESHOLD_DEFAULT"))
 
 # список RSS источников
 html_urls = [
@@ -192,6 +202,148 @@ def _call_mistral(prompt: str, model: str = "mistral-medium-latest", timeout: in
     except Exception as e:
         logger.exception("Unexpected Mistral response handling error: %s", str(e))
         return None
+    
+def load_semantic_memory() -> list:
+    try:
+        if os.path.exists(SEMANTIC_MEMORY_FILE):
+            with open(SEMANTIC_MEMORY_FILE, "r", encoding="utf-8") as f:
+                return _json.load(f)
+    except Exception as e:
+        logger.warning("Failed to load semantic memory: %s", e)
+    return []
+
+def save_semantic_memory(mem: list) -> None:
+    try:
+        with SEMANTIC_LOCK:
+            with open(SEMANTIC_MEMORY_FILE, "w", encoding="utf-8") as f:
+                _json.dump(mem, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save semantic memory: %s", e)
+
+def _mistral_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, int, float, Any]:
+    """
+    Посылает Mistral список репрезентативных заголовков и новый заголовок+текст.
+    Возвращает: (match:bool, index_or_none:int or None, score:float (0..1), raw_response)
+    """
+    # ограничиваем количество сравнений
+    limited_reps = reps[-SEMANTIC_COMPARE_LIMIT:]
+    # формируем компактный, строгий prompt (только JSON в ответ)
+    enumerated = "\n".join([f"{i+1}. {r}" for i, r in enumerate(limited_reps)]) if limited_reps else "[]"
+    prompt = f"""
+You are a strict semantic comparator. Input:
+NEW_TITLE: {new_title}
+NEW_TEXT: {new_text[:4000].replace('"', '\\"')}
+
+EXISTING_TITLES:
+{enumerated}
+
+Task: compare NEW_TITLE+NEW_TEXT to each EXISTING_TITLES by meaning (not by wording). If any existing title has the same news meaning (i.e. the same event/topic that would make them duplicates in a newsfeed), return a JSON object only, no extra text, with fields:
+{{"match": true/false, "index": <1-based index of matched EXISTING_TITLES if match, otherwise null>, "score": <similarity 0.0-1.0>, "reason": "<one-sentence explanation>"}}.
+Score must be between 0.0 and 1.0. Use a high threshold for clear duplicates; but do not invent matches. Output strictly JSON.
+"""
+    try:
+        resp = _call_mistral(prompt, model="mistral-medium-latest", timeout=30)
+        if not resp:
+            return False, None, 0.0, None
+        # постобработка: пытаемся распарсить JSON
+        try:
+            parsed = _json.loads(resp)
+            match = bool(parsed.get("match"))
+            idx = parsed.get("index")
+            score = float(parsed.get("score") or 0.0)
+            return match, (int(idx)-1 if idx is not None else None), score, parsed
+        except Exception:
+            # если Mistral не вернул правильно сформированный JSON — возвращаем raw
+            logger.warning("Mistral compare returned non-json: %s", resp[:500])
+            return False, None, 0.0, resp
+    except Exception as e:
+        logger.warning("Mistral compare error: %s", e)
+        return False, None, 0.0, None
+
+def _local_fallback_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, int, float]:
+    """
+    Быстрый локальный fallback: комбинируем сравнение title и первые 2000 символов текста.
+    Возвращает (match, index, score).
+    """
+    best_score = 0.0
+    best_idx = None
+    new_text_short = (new_text or "")[:2000]
+    for i, rep in enumerate(reps[-SEMANTIC_COMPARE_LIMIT:]):
+        # сравнение заголовков
+        title_score = difflib.SequenceMatcher(None, new_title, rep).ratio()
+        # сравнение текстов (если есть)
+        text_score = difflib.SequenceMatcher(None, new_text_short, rep).ratio()  # реп — заголовок; слабый, но всё же
+        # агрегируем: даём больший вес заголовку
+        combined = 0.7 * title_score + 0.3 * text_score
+        if combined > best_score:
+            best_score = combined
+            best_idx = i
+    match = best_score >= SEMANTIC_THRESHOLD_DEFAULT
+    return match, best_idx, best_score
+
+def is_semantic_duplicate(title: str, page_text: str, link: str = "", threshold: float = SEMANTIC_THRESHOLD_DEFAULT) -> bool:
+    """
+    Возвращает True, если семантический дубль найден (и обновляет memory — добавляет title в кластер);
+    Иначе добавляет новый кластер и возвращает False.
+    """
+    with SEMANTIC_LOCK:
+        mem = load_semantic_memory()
+        reps = [c.get("representative") for c in mem if c.get("representative")]
+    
+    # если память пуста — создаём первый кластер
+    if not reps:
+        new_cluster = {
+            "id": uuid.uuid4().hex,
+            "representative": title,
+            "titles": [title],
+            "created_at": int(time.time()),
+            "links": [link] if link else []
+        }
+        with SEMANTIC_LOCK:
+            mem.append(new_cluster)
+            save_semantic_memory(mem)
+        logger.info("Semantic memory empty — created first cluster for: %s", title)
+        return False
+
+    # пытаемся через Mistral
+    match, idx, score, raw = _mistral_compare(title, page_text, reps)
+    if match and idx is not None and score >= threshold:
+        logger.info("Mistral detected semantic duplicate (score=%.3f) vs rep idx %s: %s", score, idx, reps[idx])
+        # добавляем заголовок в кластер, если его там нет
+        with SEMANTIC_LOCK:
+            if title not in mem[idx]["titles"]:
+                mem[idx]["titles"].append(title)
+                if link:
+                    mem[idx].setdefault("links", []).append(link)
+                save_semantic_memory(mem)
+        return True
+
+    # fallback: локальное сравнение
+    fallback_match, fallback_idx, fallback_score = _local_fallback_compare(title, page_text, reps)
+    if fallback_match and fallback_score >= threshold:
+        logger.info("Local fallback marked duplicate (score=%.3f) vs rep idx %s: %s", fallback_score, fallback_idx, reps[fallback_idx])
+        with SEMANTIC_LOCK:
+            if title not in mem[fallback_idx]["titles"]:
+                mem[fallback_idx]["titles"].append(title)
+                if link:
+                    mem[fallback_idx].setdefault("links", []).append(link)
+                save_semantic_memory(mem)
+        return True
+
+    # не дубль — создаём новый кластер
+    new_cluster = {
+        "id": uuid.uuid4().hex,
+        "representative": title,
+        "titles": [title],
+        "created_at": int(time.time()),
+        "links": [link] if link else []
+    }
+    with SEMANTIC_LOCK:
+        mem.append(new_cluster)
+        # возможно полезно ограничить длину файла — оставляем последние N кластеров, но это на ваше усмотрение
+        save_semantic_memory(mem)
+    logger.info("New semantic cluster created for: %s (score_mistral=%s, fallback_score=%.3f)", title, score if 'score' in locals() else None, fallback_score if 'fallback_score' in locals() else 0.0)
+    return False
 
 def thedefiant_parsing() -> Optional[List[Dict]]:
     """
@@ -379,16 +531,24 @@ def thedefiant_parsing() -> Optional[List[Dict]]:
 
             # для логики — берем только HIGH (как в вашем примере), можно расширить
             if priority == "HIGH":
-                sort_post.append({
-                    "title": title,
-                    "link": link,
-                    "image": image,
-                    "page_text": (page_text or content_html)[:20000],
-                    "mistral_raw": mistral_resp
-                })
-                logger.info("HIGH added: %s", title)
-            else:
-                logger.info("BRUH PRIORITY: %s -> %s", title, priority)
+                # семантическая дедупликация
+                try:
+                    is_dup = is_semantic_duplicate(title, page_text or content_html or "", link=link)
+                except Exception as e:
+                    logger.warning("Semantic duplicate check failed for %s: %s", title, e)
+                    is_dup = False  # не блокируем постинг из-за ошибки дедупликации
+
+                if is_dup:
+                    logger.info("Skipped semantic duplicate: %s", title)
+                else:
+                    sort_post.append({
+                        "title": title,
+                        "link": link,
+                        "image": image,
+                        "page_text": (page_text or content_html)[:20000],
+                        "mistral_raw": mistral_resp
+                    })
+                    logger.info("HIGH added (unique): %s", title)
 
             # всегда записываем заголовок в seen (чтобы не обрабатывать повторно)
             seen.append(title)
@@ -602,15 +762,23 @@ def smartliquidity_parsing() -> Optional[List[Dict]]:
 
             # для логики — берем только HIGH (как в вашем примере), можно расширить
             if priority == "HIGH":
-                sort_post.append({
-                    "title": title,
-                    "link": link,
-                    "page_text": (page_text or content_html)[:20000],
-                    "mistral_raw": mistral_resp
-                })
-                logger.info("HIGH added: %s", title)
-            else:
-                logger.info("BRUH PRIORITY: %s -> %s", title, priority)
+                # семантическая дедупликация
+                try:
+                    is_dup = is_semantic_duplicate(title, page_text or content_html or "", link=link)
+                except Exception as e:
+                    logger.warning("Semantic duplicate check failed for %s: %s", title, e)
+                    is_dup = False  # не блокируем постинг из-за ошибки дедупликации
+
+                if is_dup:
+                    logger.info("Skipped semantic duplicate: %s", title)
+                else:
+                    sort_post.append({
+                        "title": title,
+                        "link": link,
+                        "page_text": (page_text or content_html)[:20000],
+                        "mistral_raw": mistral_resp
+                    })
+                    logger.info("HIGH added (unique): %s", title)
 
             # всегда записываем заголовок в seen (чтобы не обрабатывать повторно)
             seen.append(title)
@@ -822,15 +990,23 @@ def desk_parsing():
                 priority = match.group(1)
 
                 if priority == "HIGH":
-                    logger.info("HIGH")
+                    # семантическая дедупликация
+                    try:
+                        is_dup = is_semantic_duplicate(title_full, page_text or "", link=link_full)
+                    except Exception as e:
+                        logger.warning("Semantic duplicate check failed for %s: %s", title_full, e)
+                        is_dup = False  # не блокируем постинг из-за ошибки дедупликации
 
-                    sort_post.append({
-                        "comment": full_response, 
-                        "image": img_full,
-                        "page_text": page_text,
-                        "link": link_full,
-                        "title": title_full
-                    })
+                    if is_dup:
+                        logger.info("Skipped semantic duplicate: %s", title_full)
+                    else:
+                        sort_post.append({
+                            "title": title_full,
+                            "link": link_full,
+                            "page_text": (page_text)[:20000],
+                            "mistral_raw": full_response
+                        })
+                        logger.info("HIGH added (unique): %s", title_full)
 
                 else:
                     logger.info("BRUH PRIORITY")
@@ -1019,14 +1195,23 @@ def telegraph_parsing():
                 priority = match.group(1)
 
                 if priority == "HIGH":
-                    logger.info("HIGH")
+                    # семантическая дедупликация
+                    try:
+                        is_dup = is_semantic_duplicate(title_full, page_text or "", link=link_full)
+                    except Exception as e:
+                        logger.warning("Semantic duplicate check failed for %s: %s", title_full, e)
+                        is_dup = False  # не блокируем постинг из-за ошибки дедупликации
 
-                    sort_post.append({
-                        "comment": full_response,
-                        "page_text": page_text,
-                        "link": link_full,
-                        "title": title_full
-                    })
+                    if is_dup:
+                        logger.info("Skipped semantic duplicate: %s", title_full)
+                    else:
+                        sort_post.append({
+                            "title": title_full,
+                            "link": link_full,
+                            "page_text": (page_text)[:20000],
+                            "mistral_raw": full_response
+                        })
+                        logger.info("HIGH added (unique): %s", title_full)
 
                 else:
                     logger.info("BRUH PRIORITY")
@@ -1215,14 +1400,23 @@ def yahoo_parsing():
                 priority = match.group(1)
 
                 if priority == "HIGH":
-                    logger.info("HIGH")
+                    # семантическая дедупликация
+                    try:
+                        is_dup = is_semantic_duplicate(title_full, page_text or "", link=link_full)
+                    except Exception as e:
+                        logger.warning("Semantic duplicate check failed for %s: %s", title_full, e)
+                        is_dup = False  # не блокируем постинг из-за ошибки дедупликации
 
-                    sort_post.append({
-                        "comment": full_response,
-                        "page_text": page_text,
-                        "link": link_full,
-                        "title": title_full
-                    })
+                    if is_dup:
+                        logger.info("Skipped semantic duplicate: %s", title_full)
+                    else:
+                        sort_post.append({
+                            "title": title_full,
+                            "link": link_full,
+                            "page_text": (page_text)[:20000],
+                            "mistral_raw": full_response
+                        })
+                        logger.info("HIGH added (unique): %s", title_full)
 
                 else:
                     logger.info("BRUH PRIORITY")
