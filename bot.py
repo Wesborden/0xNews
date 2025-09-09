@@ -228,8 +228,7 @@ def _mistral_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, i
     prompt = f"""
         You are a strict semantic comparator. Input:
         NEW_TITLE: {new_title}
-        NEW_TEXT: {new_text[:4000]}
-        NEW_TEXT: {new_text[:4000].replace('"', '\\"')}
+        NEW_TEXT: json.dumps{new_text[:4000]}
 
         EXISTING_TITLES:
         {enumerated}
@@ -237,7 +236,7 @@ def _mistral_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, i
         Task: compare NEW_TITLE+NEW_TEXT to each EXISTING_TITLES by meaning (not by wording). If any existing title has the same news meaning (i.e. the same event/topic that would make them duplicates in a newsfeed), return a JSON object only, no extra text, with fields:
         {{"match": true/false, "index": <1-based index of matched EXISTING_TITLES if match, otherwise null>, "score": <similarity 0.0-1.0>, "reason": "<one-sentence explanation>"}}.
         Score must be between 0.0 and 1.0. Use a high threshold for clear duplicates; but do not invent matches. Output strictly JSON.
-        """.replace('"', '\\"')
+        """
     try:
         resp = _call_mistral(prompt, model="mistral-medium-latest", timeout=30)
         if not resp:
