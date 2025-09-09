@@ -229,6 +229,7 @@ def _mistral_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, i
         You are a strict semantic comparator. Input:
         NEW_TITLE: {new_title}
         NEW_TEXT: {new_text[:4000]}
+        NEW_TEXT: {new_text[:4000].replace('"', '\\"')}
 
         EXISTING_TITLES:
         {enumerated}
