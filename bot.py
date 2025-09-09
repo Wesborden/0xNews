@@ -240,7 +240,7 @@ def _mistral_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, i
     try:
         resp = _call_mistral(prompt, model="mistral-medium-latest", timeout=30)
         if not resp:
-            return False, None, 0.0, None
+            return False, None, 0.0, None 
         # постобработка: пытаемся распарсить JSON
         try:
             parsed = _json.loads(resp)
