@@ -221,26 +221,22 @@ def save_semantic_memory(mem: list) -> None:
         logger.warning("Failed to save semantic memory: %s", e)
 
 def _mistral_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, int, float, Any]:
-    """
-    Посылает Mistral список репрезентативных заголовков и новый заголовок+текст.
-    Возвращает: (match:bool, index_or_none:int or None, score:float (0..1), raw_response)
-    """
     # ограничиваем количество сравнений
     limited_reps = reps[-SEMANTIC_COMPARE_LIMIT:]
     # формируем компактный, строгий prompt (только JSON в ответ)
     enumerated = "\n".join([f"{i+1}. {r}" for i, r in enumerate(limited_reps)]) if limited_reps else "[]"
     prompt = f"""
-You are a strict semantic comparator. Input:
-NEW_TITLE: {new_title}
-NEW_TEXT: {new_text[:4000].replace('"', '\\"')}
+        You are a strict semantic comparator. Input:
+        NEW_TITLE: {new_title}
+        NEW_TEXT: {new_text[:4000].replace('"', '\\"')}
 
-EXISTING_TITLES:
-{enumerated}
+        EXISTING_TITLES:
+        {enumerated}
 
-Task: compare NEW_TITLE+NEW_TEXT to each EXISTING_TITLES by meaning (not by wording). If any existing title has the same news meaning (i.e. the same event/topic that would make them duplicates in a newsfeed), return a JSON object only, no extra text, with fields:
-{{"match": true/false, "index": <1-based index of matched EXISTING_TITLES if match, otherwise null>, "score": <similarity 0.0-1.0>, "reason": "<one-sentence explanation>"}}.
-Score must be between 0.0 and 1.0. Use a high threshold for clear duplicates; but do not invent matches. Output strictly JSON.
-"""
+        Task: compare NEW_TITLE+NEW_TEXT to each EXISTING_TITLES by meaning (not by wording). If any existing title has the same news meaning (i.e. the same event/topic that would make them duplicates in a newsfeed), return a JSON object only, no extra text, with fields:
+        {{"match": true/false, "index": <1-based index of matched EXISTING_TITLES if match, otherwise null>, "score": <similarity 0.0-1.0>, "reason": "<one-sentence explanation>"}}.
+        Score must be between 0.0 and 1.0. Use a high threshold for clear duplicates; but do not invent matches. Output strictly JSON.
+        """
     try:
         resp = _call_mistral(prompt, model="mistral-medium-latest", timeout=30)
         if not resp:
@@ -261,10 +257,6 @@ Score must be between 0.0 and 1.0. Use a high threshold for clear duplicates; bu
         return False, None, 0.0, None
 
 def _local_fallback_compare(new_title: str, new_text: str, reps: list) -> Tuple[bool, int, float]:
-    """
-    Быстрый локальный fallback: комбинируем сравнение title и первые 2000 символов текста.
-    Возвращает (match, index, score).
-    """
     best_score = 0.0
     best_idx = None
     new_text_short = (new_text or "")[:2000]
@@ -282,10 +274,6 @@ def _local_fallback_compare(new_title: str, new_text: str, reps: list) -> Tuple[
     return match, best_idx, best_score
 
 def is_semantic_duplicate(title: str, page_text: str, link: str = "", threshold: float = SEMANTIC_THRESHOLD_DEFAULT) -> bool:
-    """
-    Возвращает True, если семантический дубль найден (и обновляет memory — добавляет title в кластер);
-    Иначе добавляет новый кластер и возвращает False.
-    """
     with SEMANTIC_LOCK:
         mem = load_semantic_memory()
         reps = [c.get("representative") for c in mem if c.get("representative")]
@@ -346,10 +334,6 @@ def is_semantic_duplicate(title: str, page_text: str, link: str = "", threshold:
     return False
 
 def thedefiant_parsing() -> Optional[List[Dict]]:
-    """
-    Парсит feed (заданный внутри), использует get_page_text для получения текста статьи,
-    отправляет на Mistral для классификации приоритета. Возвращает список словарей с HIGH-новостями.
-    """
     try:
         url = "https://thedefiant.io/api/feed"  # поменяйте тут, если нужно другой feed
         limit = 10                       # сколько элементов брать
@@ -578,10 +562,6 @@ def thedefiant_parsing() -> Optional[List[Dict]]:
     
 
 def smartliquidity_parsing() -> Optional[List[Dict]]:
-    """
-    Парсит feed (заданный внутри), использует get_page_text для получения текста статьи,
-    отправляет на Mistral для классификации приоритета. Возвращает список словарей с HIGH-новостями.
-    """
     try:
         url = "https://smartliquidity.info/feed/"
         limit = 10                       # сколько элементов брать
